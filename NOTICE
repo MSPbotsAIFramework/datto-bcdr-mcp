@@ -1,0 +1,9 @@
+Datto BCDR MCP Server
+Copyright 2026 MSPbots.ai
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+"Datto", "SIRIS" and "ALTO" are trademarks of their respective owner. This
+project is an independent integration that calls the documented Datto
+partner REST API; it contains no Datto source code and is not affiliated
+with or endorsed by Datto.

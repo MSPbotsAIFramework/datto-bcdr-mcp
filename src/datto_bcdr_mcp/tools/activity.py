@@ -22,7 +22,20 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ..api_client import DattoClient, segment
-from ._common import READ_ONLY, ClientFactory, IsoTime, Page, PerPage, page_info, parse_time, run_tool, to_datetime
+from ._common import (
+    READ_ONLY,
+    ClientFactory,
+    IsoTime,
+    Offset,
+    Page,
+    PerPage,
+    continuation,
+    locate,
+    page_info,
+    parse_time,
+    run_tool,
+    to_datetime,
+)
 
 DEFAULT_WINDOW = timedelta(days=7)
 _DEVICE_LIMIT = 1000
@@ -55,6 +68,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         until: IsoTime = None,
         page: Page = None,
         perPage: PerPage = None,
+        offset: Offset = None,
     ) -> str:
         """List the alerts currently open on all appliances, raised in a time window (default 7 days).
 
@@ -83,15 +97,17 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
 
             found = [a for group in await asyncio.gather(*(for_device(d) for d in with_alerts)) for a in group]
             found.sort(key=lambda a: to_datetime(a.get("dateTriggered")) or datetime.min.replace(tzinfo=UTC), reverse=True)
-            number, size = page or 1, perPage or 50
-            window = found[(number - 1) * size : number * size]
+            number, size, at = locate(offset, page, perPage)
+            window = found[at : number * size]
+            more = number * size < len(found)
             return {
                 "alerts": window,
                 "count": len(window),
                 "page": number,
                 "per_page": size,
                 "total": len(found),
-                "has_more": number * size < len(found),
+                "has_more": more,
+                **continuation(at, at + len(window), more),
                 "since": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "until": end.strftime("%Y-%m-%dT%H:%M:%SZ") if end else None,
                 "devicesScanned": len(with_alerts),
@@ -109,6 +125,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         clientName: Annotated[
             str | None, Field(description="Only activity whose client name contains this text (case-insensitive).")
         ] = None,
+        offset: Offset = None,
     ) -> str:
         """List partner portal activity-log entries (who did what, on which target), default last 7 days.
 
@@ -125,7 +142,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
                 start = now - timedelta(hours=_ACTIVITY_MAX_HOURS)
                 if end is not None and end < start:
                     raise ValueError("until is more than 31 days ago; the Datto activity log covers only the last 31 days.")
-            number, size = page or 1, perPage or 50
+            number, size, at = locate(offset, page, perPage)
             extra = {"since": hours, "sinceUnits": "hours"}
             name = (clientName or "").strip().lower()
 
@@ -138,19 +155,25 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
                 matched = [
                     e for e in entries if isinstance(e, dict) and in_window(e) and name in str(e.get("clientName") or "").lower()
                 ]
-                items = matched[(number - 1) * size : number * size]
+                items = matched[at : number * size]
+                more = number * size < len(matched)
                 paging = {
                     "page": number,
                     "per_page": size,
                     "total": len(matched),
-                    "has_more": number * size < len(matched),
+                    "has_more": more,
                     "scanned": len(entries),
                     "scan_incomplete": truncated or None,
-                }
+                } | continuation(at, at + len(items), more)
             else:
                 result = await client.page("report/activity-log", number, size, extra)
-                items = [i for i in result["items"] if in_window(i)]
+                read = result["items"][at - (number - 1) * size :]
+                # Entries outside the window (newer than until) lead the newest-first page: skip them
+                # so a cut result continues from the right position.
+                lead = next((k for k, entry in enumerate(read) if in_window(entry)), len(read))
+                items = [i for i in read[lead:] if in_window(i)]
                 paging = page_info(result["pagination"], number, size, len(result["items"]))
+                paging |= continuation(at, at + len(read), paging["has_more"], at + lead)
             return {"activity": items, "count": len(items)} | paging | {
                 "since": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "until": end.strftime("%Y-%m-%dT%H:%M:%SZ") if end else None,

@@ -35,9 +35,14 @@ are addressed by `serialNumber`; the `agentId` of the asset tools is the asset's
 (the `name` / `volume` field from `datto_bcdr_list_assets`). Datto timestamps are Unix seconds;
 the tools add ISO 8601 `...At` fields next to them.
 
+The list tools with `page` / `perPage` also take `offset` (record position, overrides `page`) and
+return `offset` / `next_offset`: a page cut to fit the response size limit has no other page holding
+its rest, so `next_offset` starts right after the last record returned; pass it as `offset` to
+continue without gaps.
+
 | Tool | Purpose | Parameters (required in **bold**) |
 |---|---|---|
-| `datto_bcdr_list_devices` | Appliances: serial, name, model, client, last seen, storage, agent / alert counts | page, perPage (max 250) |
+| `datto_bcdr_list_devices` | Appliances: serial, name, model, client, last seen, storage, agent / alert counts | page, perPage (max 250), offset |
 | `datto_bcdr_get_device` | One appliance with its agents, shares and current alerts | **serialNumber** |
 | `datto_bcdr_list_assets` | Machines and shares an appliance protects, with last snapshot, offsite and screenshot state | **serialNumber** |
 | `datto_bcdr_get_asset` | One protected asset: OS, agent version, volumes, paused / archived, last snapshot, offsite | **serialNumber**, **agentId** |
@@ -45,8 +50,8 @@ the tools add ISO 8601 `...At` fields next to them.
 | `datto_bcdr_list_screenshots` | Screenshot (boot) verification: the latest attempt (`latest`), plus per-snapshot results of the recent snapshots the API returns (about the last 10) | **serialNumber**, **agentId** |
 | `datto_bcdr_get_screenshot` | The latest screenshot-verification image (JPEG) | **serialNumber**, **agentId**, epoch |
 | `datto_bcdr_get_offsite_status` | Offsite storage used and each asset's latest offsite point; lists assets never sent offsite | **serialNumber** |
-| `datto_bcdr_list_alerts` | Alerts currently open on all appliances, raised in a window (default last 7 days), newest first; cleared alerts are not returned (no history) | since, until, page, perPage |
-| `datto_bcdr_list_activity` | Partner portal activity log (who did what, on which target), default last 7 days, at most the last 31 days | since, until, page, perPage, clientName |
+| `datto_bcdr_list_alerts` | Alerts currently open on all appliances, raised in a window (default last 7 days), newest first; cleared alerts are not returned (no history) | since, until, page, perPage, offset |
+| `datto_bcdr_list_activity` | Partner portal activity log (who did what, on which target), default last 7 days, at most the last 31 days | since, until, page, perPage, offset, clientName |
 
 Errors come back as a JSON envelope instead of an exception:
 

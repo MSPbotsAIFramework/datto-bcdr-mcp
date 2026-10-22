@@ -44,6 +44,11 @@ AgentId = Annotated[
 ]
 Page = Annotated[int | None, Field(description="Page number, from 1 (default 1).", ge=1)]
 PerPage = Annotated[int | None, Field(description="Results per page (default 50, max 250).", ge=1, le=250)]
+Offset = Annotated[
+    int | None,
+    Field(description="Record position to start from (0-based, overrides page); pass next_offset from the previous result.", ge=0),
+]
+DEFAULT_PAGE_SIZE = 50
 IsoTime = Annotated[str | None, Field(description="ISO 8601 date-time, e.g. 2026-06-01T00:00:00Z.")]
 
 
@@ -78,6 +83,32 @@ def to_datetime(value: Any) -> datetime | None:
 def iso(value: Any) -> str | None:
     moment = to_datetime(value)
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ") if moment else None
+
+
+def locate(offset: int | None, page: int | None, per_page: int | None) -> tuple[int, int, int]:
+    """(page, perPage, start) for a read from record ``start``.
+
+    Datto pages by number only, so a position is reached by asking for the page that holds it
+    (same page size) and skipping the records before it. Locally paged lists slice the same way.
+    """
+    size = per_page or DEFAULT_PAGE_SIZE
+    start = offset if offset is not None else ((page or 1) - 1) * size
+    return start // size + 1, size, start
+
+
+def continuation(start: int, after: int, more: bool, first: int | None = None) -> dict:
+    """offset / next_offset paging fields for records read from ``start`` up to ``after``.
+
+    next_offset continues right after the last record returned, also when the result is cut to
+    fit the size limit (a page number cannot: the rest of a cut page is not on any other page).
+    ``first`` is the position of the first record returned when records before it were dropped.
+    """
+    first = start if first is None else first
+    return {
+        "offset": start,
+        "next_offset": after if more else None,
+        "_resume": {"key": "next_offset", "start": first},
+    }
 
 
 def page_info(pagination: Any, page: int, per_page: int, count: int) -> dict:

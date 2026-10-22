@@ -18,22 +18,34 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ..api_client import DattoClient, segment
-from ._common import READ_ONLY, ClientFactory, Page, PerPage, SerialNumber, iso, page_info, run_tool
+from ._common import (
+    READ_ONLY,
+    ClientFactory,
+    Offset,
+    Page,
+    PerPage,
+    SerialNumber,
+    continuation,
+    iso,
+    locate,
+    page_info,
+    run_tool,
+)
 
 _ASSET_LIMIT = 2000
 
 
 def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
     @mcp.tool(annotations=READ_ONLY)
-    async def datto_bcdr_list_devices(page: Page = None, perPage: PerPage = None) -> str:
+    async def datto_bcdr_list_devices(page: Page = None, perPage: PerPage = None, offset: Offset = None) -> str:
         """List BCDR appliances: serial, name, model, client, last seen, storage, agent / alert counts."""
 
         async def action(client: DattoClient) -> dict:
-            number, size = page or 1, perPage or 50
+            number, size, start = locate(offset, page, perPage)
             result = await client.page("bcdr/device", number, size)
-            return {"devices": result["items"], "count": len(result["items"])} | page_info(
-                result["pagination"], number, size, len(result["items"])
-            )
+            items = result["items"][start - (number - 1) * size :]
+            info = page_info(result["pagination"], number, size, len(result["items"]))
+            return {"devices": items, "count": len(items)} | info | continuation(start, start + len(items), info["has_more"])
 
         return await run_tool("datto_bcdr_list_devices", client_factory, action)
 

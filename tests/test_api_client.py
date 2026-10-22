@@ -319,3 +319,138 @@ async def test_list_screenshots_reports_latest_when_snapshots_have_none(monkeypa
         "at": "2026-06-01T00:05:00Z", "epoch": 1780272300, "status": True, "imageUrl": "https://img/latest"
     }
     assert "latest" in result["note"]
+
+
+# ---- Page-number paging that survives truncation (offset / next_offset) -----------------------------
+# Self-test checklist: a cut page continues right after the last record returned (from page 1 and
+# from a later page); offset aligned / not aligned to a page; offset 0; offset past the end; offset
+# wins over page; page-only calls send the same request as before; no retry hint for a page size.
+# devices and activity page at Datto; alerts and activity with clientName page here over the fetched list.
+
+TOTAL = 137
+BIG = {f"f{k}": f"value {k}" for k in range(40)}
+
+
+def _rows(big):
+    """TOTAL records with id i, in the order each tool returns them (alerts newest first)."""
+    extra = BIG if big else {}
+    return [
+        {"id": i, "serialNumber": "S1", "dateTriggered": ts(i / 1000), "timestamp": ts(1), "clientName": "Winston", **extra}
+        for i in range(TOTAL)
+    ]
+
+
+def _datto_api(rows):
+    """Pages by _page / _perPage like Datto, with totalPages."""
+
+    def reply(request):
+        number, size = int(request.url.params["_page"]), int(request.url.params["_perPage"])
+        pages = max(1, -(-len(rows) // size))
+        return httpx.Response(200, json=paged(rows[(number - 1) * size : number * size], number, pages))
+
+    return reply
+
+
+def _recorder(tool, rows):
+    if tool == "datto_bcdr_list_devices":
+        return Recorder({"bcdr/device": _datto_api(rows)})
+    if tool == "datto_bcdr_list_alerts":
+        return Recorder({"bcdr/device": paged([{"serialNumber": "S1", "alertCount": len(rows)}]), "bcdr/device/S1/alert": _datto_api(rows)})
+    return Recorder({"report/activity-log": _datto_api(rows)})
+
+
+PAGED_TOOLS = [
+    ("datto_bcdr_list_devices", "devices", {}),
+    ("datto_bcdr_list_activity", "activity", {}),
+    ("datto_bcdr_list_alerts", "alerts", {}),
+    ("datto_bcdr_list_activity", "activity", {"clientName": "winston"}),
+]
+API_PAGED = PAGED_TOOLS[:2]
+
+
+async def _walk(monkeypatch, rec, tool, key, args):
+    ids, calls, cut = [], 0, 0
+    while True:
+        result = await _call(monkeypatch, rec, tool, args)
+        calls += 1
+        assert "retry_page_size" not in result, result.get("note")
+        cut += bool(result.get("truncated"))
+        ids += [r["id"] for r in result[key]]
+        if result.get("next_offset") is None:
+            return ids, cut
+        args = {k: v for k, v in args.items() if k != "page"} | {"offset": result["next_offset"]}
+        assert calls < 200
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+async def test_cut_pages_continue_without_gaps_from_page_1(monkeypatch, tool, key, extra):
+    ids, cut = await _walk(monkeypatch, _recorder(tool, _rows(True)), tool, key, extra | {"perPage": 50})
+    assert cut > 0  # pages really were cut
+    assert ids == list(range(TOTAL))  # no gaps, no duplicates
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+async def test_cut_pages_continue_without_gaps_from_a_later_page(monkeypatch, tool, key, extra):
+    ids, cut = await _walk(monkeypatch, _recorder(tool, _rows(True)), tool, key, extra | {"page": 3, "perPage": 40})
+    assert cut > 0
+    assert ids == list(range(80, TOTAL))
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+@pytest.mark.parametrize("offset,size,page,first", [(30, 25, 2, 30), (50, 25, 3, 50), (0, 25, 1, 0), (70, None, 2, 70)])
+async def test_offset_reads_the_page_that_holds_it(monkeypatch, tool, key, extra, offset, size, page, first):
+    result = await _call(monkeypatch, _recorder(tool, _rows(False)), tool, extra | {"offset": offset} | ({"perPage": size} if size else {}))
+    assert result[key][0]["id"] == first and result["offset"] == offset and result["page"] == page
+    assert result["next_offset"] == page * (size or 50)  # rest of the page returned, next page starts after it
+
+
+@pytest.mark.parametrize("tool,key,extra", API_PAGED)
+@pytest.mark.parametrize("offset,size,page", [(30, 25, 2), (50, 25, 3), (0, 25, 1), (70, None, 2)])
+async def test_offset_asks_datto_for_the_page_that_holds_it(monkeypatch, tool, key, extra, offset, size, page):
+    rec = _recorder(tool, _rows(False))
+    await _call(monkeypatch, rec, tool, extra | {"offset": offset} | ({"perPage": size} if size else {}))
+    params = rec.requests[0].url.params
+    assert (params["_page"], params["_perPage"]) == (str(page), str(size or 50))
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+async def test_offset_past_the_end_is_empty(monkeypatch, tool, key, extra):
+    result = await _call(monkeypatch, _recorder(tool, _rows(False)), tool, extra | {"offset": 500, "perPage": 25})
+    assert (result["count"], result["has_more"], result.get("next_offset")) == (0, False, None)
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+async def test_offset_wins_over_page(monkeypatch, tool, key, extra):
+    rec = _recorder(tool, _rows(False))
+    result = await _call(monkeypatch, rec, tool, extra | {"offset": 10, "page": 4, "perPage": 10})
+    assert result["page"] == 2 and result[key][0]["id"] == 10
+    if (tool, key, extra) in API_PAGED:
+        assert rec.requests[0].url.params["_page"] == "2"
+
+
+@pytest.mark.parametrize("tool,key,extra", PAGED_TOOLS)
+@pytest.mark.parametrize("args", [{"page": 2, "perPage": 25}, {"page": 2}, {}])
+async def test_page_only_sends_the_same_request_and_returns_the_same_records(monkeypatch, tool, key, extra, args):
+    rec = _recorder(tool, _rows(False))
+    result = await _call(monkeypatch, rec, tool, extra | args)
+    number, size = args.get("page", 1), args.get("perPage", 50)
+    if (tool, key, extra) in API_PAGED:
+        params = rec.requests[0].url.params
+        assert (params["_page"], params["_perPage"]) == (str(number), str(size))
+    assert [r["id"] for r in result[key]] == list(range((number - 1) * size, number * size))
+    assert (result["page"], result["offset"], result["next_offset"], result["has_more"]) == (
+        number, (number - 1) * size, number * size, True)
+
+
+async def test_activity_until_skips_newer_entries_and_a_cut_page_continues(monkeypatch):
+    until = datetime.now(UTC) - timedelta(days=2)
+    rows = [{"id": i, "timestamp": ts(1 + i / 100), **BIG} for i in range(TOTAL)]
+    newer = [{"id": -1 - i, "timestamp": ts(0.5), **BIG} for i in range(7)]  # after until, newest first
+    rec = Recorder({"report/activity-log": _datto_api(newer + rows)})
+    args = {"until": until.strftime("%Y-%m-%dT%H:%M:%SZ"), "perPage": 50}
+    ids, cut = await _walk(monkeypatch, rec, "datto_bcdr_list_activity", "activity", args)
+    assert cut > 0 and ids == [r["id"] for r in rows if to_dt(r["timestamp"]) <= until]
+
+
+def to_dt(text):
+    return datetime.fromisoformat(text)

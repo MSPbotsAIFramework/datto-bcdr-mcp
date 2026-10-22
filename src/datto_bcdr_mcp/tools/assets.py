@@ -98,7 +98,11 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
 
     @mcp.tool(annotations=READ_ONLY)
     async def datto_bcdr_list_screenshots(serialNumber: SerialNumber, agentId: AgentId) -> str:
-        """List screenshot (boot) verification results of an asset's snapshots, newest first."""
+        """Get an asset's screenshot (boot) verification: the latest attempt, plus per-snapshot results.
+
+        latest is the most recent verification (time, status, image link). Per-snapshot results
+        only cover the recent snapshots the API returns (about the last 10), so they are often empty.
+        """
 
         async def action(client: DattoClient) -> dict:
             asset = await get_asset(client, serialNumber, agentId)
@@ -108,11 +112,30 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
                 if isinstance(verification, dict) and (verification.get("status") or verification.get("image")):
                     rows.append({"timestamp": snap.get("timestamp"), "status": verification.get("status"), "image": verification.get("image")})
             rows.sort(key=lambda r: to_datetime(r["timestamp"]) or to_datetime(0), reverse=True)
+            attempt = asset.get("lastScreenshotAttempt")
+            latest = (
+                {
+                    "at": iso(attempt),
+                    "epoch": attempt,
+                    "status": asset.get("lastScreenshotAttemptStatus"),
+                    "imageUrl": asset.get("lastScreenshotUrl"),
+                }
+                if attempt
+                else None
+            )
+            note = None
+            if latest and not rows:
+                note = (
+                    "None of the recent snapshots the API returns carries a screenshot result; "
+                    "latest is the most recent verification. Older results are not available."
+                )
             return {
                 "serialNumber": serialNumber.strip(),
                 "agentId": agentId.strip(),
+                "latest": latest,
                 "screenshots": rows,
                 "count": len(rows),
+                "note": note,
                 "lastScreenshotAttempt": asset.get("lastScreenshotAttempt"),
                 "lastScreenshotAttemptAt": iso(asset.get("lastScreenshotAttempt")),
                 "lastScreenshotAttemptStatus": asset.get("lastScreenshotAttemptStatus"),
@@ -130,7 +153,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
             Field(description="Optional: Unix time of the screenshot wanted; the API only serves the latest one, so it must match it."),
         ] = None,
     ) -> Any:
-        """Fetch the latest screenshot-verification image (PNG) of an asset."""
+        """Fetch the latest screenshot-verification image of an asset (Datto serves it as JPEG)."""
 
         async def action(client: DattoClient) -> Any:
             if epoch is not None:

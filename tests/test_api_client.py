@@ -246,8 +246,76 @@ async def test_alerts_window_validation(monkeypatch):
 async def test_activity_sends_since_in_hours(monkeypatch):
     rec = Recorder({"report/activity-log": paged([{"timestamp": ts(0.2), "action": "login"}])})
     since = (datetime.now(UTC) - timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    result = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"since": since, "clientName": "Example"})
+    result = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"since": since})
     params = rec.requests[0].url.params
-    assert (params["sinceUnits"], params["clientName"]) == ("hours", "Example")
+    assert params["sinceUnits"] == "hours" and "clientName" not in params
     assert params["since"] in ("10", "11")
     assert result["activity"][0]["action"] == "login"
+
+
+
+# ---- PRD-20992: clientName is matched here ------------------------------------------------
+
+
+def _activity_log(entries):
+    def reply(request):
+        number, size = int(request.url.params["_page"]), int(request.url.params["_perPage"])
+        pages = max(1, -(-len(entries) // size))
+        return httpx.Response(200, json=paged(entries[(number - 1) * size : number * size], number, pages))
+
+    return reply
+
+
+async def test_activity_client_name_is_matched_locally(monkeypatch):
+    entries = [{"timestamp": ts(1), "clientName": "Winston Insurance", "action": f"a{i}"} for i in range(11)]
+    entries += [{"timestamp": ts(1), "clientName": "Other Co", "action": "x"}]
+    rec = Recorder({"report/activity-log": _activity_log(entries)})
+    for name in ("Winston Insurance", "winston insurance", "Winston"):
+        result = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"clientName": name})
+        assert result["total"] == 11 and result["count"] == 11 and result["has_more"] is False
+        assert {e["clientName"] for e in result["activity"]} == {"Winston Insurance"}
+    assert all("clientName" not in r.url.params for r in rec.requests)
+    none = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"clientName": "Nobody"})
+    assert (none["total"], none["count"]) == (0, 0)
+
+
+async def test_activity_client_name_pages_the_matches(monkeypatch):
+    entries = [{"timestamp": ts(1), "clientName": "Winston Insurance", "action": f"a{i}"} for i in range(5)]
+    rec = Recorder({"report/activity-log": _activity_log(entries)})
+    second = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"clientName": "winston", "page": 2, "perPage": 2})
+    assert [e["action"] for e in second["activity"]] == ["a2", "a3"]
+    assert (second["total"], second["has_more"]) == (5, True)
+
+
+# ---- PRD-20993 (1): the activity log covers 31 days -----------------------------------------
+
+
+async def test_activity_since_beyond_31_days_is_clamped(monkeypatch):
+    rec = Recorder({"report/activity-log": paged([])})
+    result = await _call(monkeypatch, rec, "datto_bcdr_list_activity", {"since": "2026-01-01T00:00:00Z"})
+    assert rec.requests[0].url.params["since"] == "743"
+    assert result["since_clamped"] is True and "31 days" in result["note"]
+
+
+async def test_activity_until_beyond_31_days_is_explained(monkeypatch):
+    rec = Recorder()
+    result = await _call(
+        monkeypatch, rec, "datto_bcdr_list_activity", {"since": "2026-01-01T00:00:00Z", "until": "2026-01-02T00:00:00Z"}
+    )
+    assert result["error"]["code"] == "invalid_argument" and "31 days" in result["error"]["message"]
+    assert rec.requests == []
+
+
+# ---- PRD-20991: the latest screenshot attempt is the main result -----------------------------
+
+
+async def test_list_screenshots_reports_latest_when_snapshots_have_none(monkeypatch):
+    asset = dict(ASSET, lastScreenshotUrl="https://img/latest",
+                 backups=[{"timestamp": ts(0.01 * i), "backup": {"status": "success"}} for i in range(10)])
+    rec = Recorder({"bcdr/device/S1/asset/SRV01": [asset]})
+    result = await _call(monkeypatch, rec, "datto_bcdr_list_screenshots", {"serialNumber": "S1", "agentId": "SRV01"})
+    assert result["count"] == 0
+    assert result["latest"] == {
+        "at": "2026-06-01T00:05:00Z", "epoch": 1780272300, "status": True, "imageUrl": "https://img/latest"
+    }
+    assert "latest" in result["note"]
